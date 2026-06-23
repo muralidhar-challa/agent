@@ -44,6 +44,30 @@ fn system_prompt() -> String {
         .replace("{AGENT_DIR}", &dir)
 }
 
+fn inject_skill(task: &str) -> String {
+    let dir = agent_dir();
+    // Detect task type and inject relevant skill into context
+    let skill_file = if task.to_lowercase().contains("docx")
+        || task.to_lowercase().contains("document")
+        || task.to_lowercase().contains("template")
+        || task.to_lowercase().contains("bodr")
+        || task.to_lowercase().contains("fill")
+    {
+        Some(format!("{dir}/skills/python-docs.md"))
+    } else if task.to_lowercase().contains("pdf") {
+        Some(format!("{dir}/skills/pdf.md"))
+    } else {
+        None
+    };
+
+    if let Some(skill_path) = skill_file {
+        if let Ok(content) = std::fs::read_to_string(&skill_path) {
+            return format!("\n\n---\n## SKILL — injected from {skill_path}\n\n{content}");
+        }
+    }
+    String::new()
+}
+
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
 fn tool_defs() -> Value {
@@ -162,7 +186,7 @@ fn read_pdf(model: &str, path: &str, question: &str) -> String {
 
 // ── LLM ReAct call ────────────────────────────────────────────────────────────
 
-fn llm_call(model: &str, messages: &Value) -> Result<Value, String> {
+fn llm_call(model: &str, messages: &Value, _skill_ctx: &str) -> Result<Value, String> {
     let mut msgs = messages.clone();
     let mut last_err = String::new();
 
@@ -203,7 +227,7 @@ fn llm_call(model: &str, messages: &Value) -> Result<Value, String> {
         let req = json!({
             "model":      model,
             "max_tokens": 16000,
-            "system":     [{"type": "text", "text": system_prompt(), "cache_control": {"type": "ephemeral"}}],
+            "system":     [{"type": "text", "text": format!("{}{}", system_prompt(), _skill_ctx), "cache_control": {"type": "ephemeral"}}],
             "tools":      tools.clone(),
             "messages":   req_msgs,
         });
@@ -284,6 +308,7 @@ fn append_thread(thread_id: &str, messages: &[Value]) {
 // ── ReAct loop ────────────────────────────────────────────────────────────────
 
 fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -> Result<String, String> {
+    let skill_ctx = inject_skill(task);
     // Load prior thread history if thread_id given, then append the new task
     let mut messages = if let Some(tid) = thread_id {
         let mut history = load_thread(tid);
@@ -298,7 +323,7 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
 
     for iter in 0..max_iter {
         eprintln!("[agent] iter {}", iter + 1);
-        let resp = match llm_call(model, &messages) {
+        let resp = match llm_call(model, &messages, &skill_ctx) {
             Ok(v)  => v,
             Err(e) => return Err(format!("llm error on iteration {}: {}", iter + 1, e)),
         };
