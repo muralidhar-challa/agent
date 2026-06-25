@@ -307,10 +307,12 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
     // Build system prompt once — identical string every iteration = stable cache key
     let skill_ctx = inject_skill(task);
     let full_system = format!("{}{}", system_prompt(), skill_ctx);
-    // 4th cache breakpoint — task never changes within a run
+    // 4th cache breakpoint — task + run start timestamp, stable for entire run
+    let run_ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let task_with_ts = format!("[run started: {run_ts}]\n{task}");
     let task_msg = json!({
         "role": "user",
-        "content": [{"type": "text", "text": task, "cache_control": {"type": "ephemeral"}}]
+        "content": [{"type": "text", "text": task_with_ts, "cache_control": {"type": "ephemeral"}}]
     });
     // Load prior thread history if thread_id given, then append the new task
     let mut messages = if let Some(tid) = thread_id {
@@ -388,21 +390,24 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
                 _ => format!("unknown tool: {name}"),
             };
 
+            // Stamp every tool result with current time for loop detection.
+            let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
             // If output exceeds threshold, write full content to disk and send agent a pointer.
             const MAX_INLINE_CHARS: usize = 16_000;
             let result = if raw.len() > MAX_INLINE_CHARS {
                 let out_path = format!("/tmp/tool_result_{}.txt", id);
                 match std::fs::write(&out_path, &raw) {
                     Ok(_) => format!(
-                        "Output too large ({} chars) — full content saved to {out_path}\n\
+                        "[{ts}] Output too large ({} chars) — full content saved to {out_path}\n\
                          Query it with grep/head/sed/awk rather than reading the whole file.\n\
                          Example: grep -n 'keyword' {out_path} | head -30",
                         raw.len()
                     ),
-                    Err(e) => format!("Output too large ({} chars) and could not save to disk: {e}", raw.len()),
+                    Err(e) => format!("[{ts}] Output too large ({} chars) and could not save to disk: {e}", raw.len()),
                 }
             } else {
-                raw
+                format!("[{ts}]\n{raw}")
             };
 
             tool_results.push(json!({
