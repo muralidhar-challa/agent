@@ -44,28 +44,23 @@ fn system_prompt() -> String {
         .replace("{AGENT_DIR}", &dir)
 }
 
-fn inject_skill(task: &str) -> String {
+fn inject_skill(_task: &str) -> String {
     let dir = agent_dir();
-    // Detect task type and inject relevant skill into context
-    let skill_file = if task.to_lowercase().contains("docx")
-        || task.to_lowercase().contains("document")
-        || task.to_lowercase().contains("template")
-        || task.to_lowercase().contains("bodr")
-        || task.to_lowercase().contains("fill")
-    {
-        Some(format!("{dir}/skills/python-docs.md"))
-    } else if task.to_lowercase().contains("pdf") {
-        Some(format!("{dir}/skills/pdf.md"))
-    } else {
-        None
-    };
-
-    if let Some(skill_path) = skill_file {
-        if let Ok(content) = std::fs::read_to_string(&skill_path) {
-            return format!("\n\n---\n## SKILL — injected from {skill_path}\n\n{content}");
+    let skills_dir = format!("{dir}/skills");
+    let mut out = String::new();
+    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+        let mut paths: Vec<_> = entries.flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "md").unwrap_or(false))
+            .collect();
+        paths.sort();
+        for path in paths {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                out.push_str(&format!("\n\n---\n## SKILL — {}\n\n{}", path.display(), content));
+            }
         }
     }
-    String::new()
+    out
 }
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
@@ -292,17 +287,18 @@ fn load_thread(thread_id: &str) -> Vec<Value> {
         .collect()
 }
 
-fn append_thread(thread_id: &str, messages: &[Value]) {
+fn append_thread(thread_id: &str, new_messages: &[Value]) {
+    use std::io::Write;
     let path = thread_path(thread_id);
-    let mut out = String::new();
-    for msg in messages {
+    let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("[agent] thread write error: {e}"); return; }
+    };
+    for msg in new_messages {
         if let Ok(line) = serde_json::to_string(msg) {
-            out.push_str(&line);
-            out.push('\n');
+            let _ = writeln!(file, "{line}");
         }
     }
-    // Rewrite the whole file — messages is the full history
-    let _ = std::fs::write(&path, out);
 }
 
 // ── ReAct loop ────────────────────────────────────────────────────────────────
@@ -311,17 +307,24 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
     // Build system prompt once — identical string every iteration = stable cache key
     let skill_ctx = inject_skill(task);
     let full_system = format!("{}{}", system_prompt(), skill_ctx);
+    // 4th cache breakpoint — task never changes within a run
+    let task_msg = json!({
+        "role": "user",
+        "content": [{"type": "text", "text": task, "cache_control": {"type": "ephemeral"}}]
+    });
     // Load prior thread history if thread_id given, then append the new task
     let mut messages = if let Some(tid) = thread_id {
         let mut history = load_thread(tid);
         if !history.is_empty() {
             eprintln!("[agent] resuming thread {} ({} prior messages)", tid, history.len());
         }
-        history.push(json!({ "role": "user", "content": task }));
+        history.push(task_msg);
         json!(history)
     } else {
-        json!([{ "role": "user", "content": task }])
+        json!([task_msg])
     };
+    // Track how many messages are already on disk — only append new ones each round-trip
+    let mut persisted_len = messages.as_array().map(|a| a.len()).unwrap_or(0) - 1;
 
     for iter in 0..max_iter {
         eprintln!("[agent] iter {}", iter + 1);
@@ -351,7 +354,8 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
         if tool_calls.is_empty() {
             eprintln!("[agent] done after {} iter(s)", iter + 1);
             if let Some(tid) = thread_id {
-                append_thread(tid, messages.as_array().unwrap());
+                let all = messages.as_array().unwrap();
+                append_thread(tid, &all[persisted_len..]);
             }
             return Ok(text_parts.join("\n"));
         }
@@ -404,7 +408,9 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
             .push(json!({ "role": "user", "content": tool_results }));
 
         if let Some(tid) = thread_id {
-            append_thread(tid, messages.as_array().unwrap());
+            let all = messages.as_array().unwrap();
+            append_thread(tid, &all[persisted_len..]);
+            persisted_len = all.len();
         }
     }
 
