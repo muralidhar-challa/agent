@@ -13,7 +13,7 @@ use std::io::Read;
 
 const DEFAULT_MODEL: &str = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
 const DEFAULT_MAX_ITER: usize = 50;
-const DEFAULT_LLM_URL: &str = "http://llm.aispec-system.svc.cluster.local/anthropic/v1/messages";
+const DEFAULT_LLM_URL: &str = "https://api.anthropic.com/v1/messages";
 
 fn llm_url() -> String {
     std::env::var("LLM_URL").unwrap_or_else(|_| DEFAULT_LLM_URL.to_string())
@@ -40,7 +40,11 @@ fn system_prompt() -> String {
     let dir = agent_dir();
     let path = format!("{dir}/system.md");
     std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| format!("You are a task-executing ai-agent. On your first action, run: cat {dir}/CLAUDE.md"))
+        .unwrap_or_else(|_| {
+            format!(
+                "You are a task-executing ai-agent. On your first action, run: cat {dir}/CLAUDE.md"
+            )
+        })
         .replace("{AGENT_DIR}", &dir)
 }
 
@@ -49,14 +53,19 @@ fn inject_skill(_task: &str) -> String {
     let skills_dir = format!("{dir}/skills");
     let mut out = String::new();
     if let Ok(entries) = std::fs::read_dir(&skills_dir) {
-        let mut paths: Vec<_> = entries.flatten()
+        let mut paths: Vec<_> = entries
+            .flatten()
             .map(|e| e.path())
             .filter(|p| p.extension().map(|e| e == "md").unwrap_or(false))
             .collect();
         paths.sort();
         for path in paths {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                out.push_str(&format!("\n\n---\n## SKILL — {}\n\n{}", path.display(), content));
+                out.push_str(&format!(
+                    "\n\n---\n## SKILL — {}\n\n{}",
+                    path.display(),
+                    content
+                ));
             }
         }
     }
@@ -79,7 +88,7 @@ fn tool_defs() -> Value {
         {
             "name": "read_image",
             "description": "Read a JPEG or PNG image and extract information using vision AI. \
-Processes the entire image in a single API call — ask for everything needed in one question.",
+    Processes the entire image in a single API call — ask for everything needed in one question.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -92,7 +101,7 @@ Processes the entire image in a single API call — ask for everything needed in
         {
             "name": "read_pdf",
             "description": "Read a PDF file and extract information using AI. \
-Submits the entire PDF in a single API call (limit: 100 pages / 32 MB) — ask for everything needed in one comprehensive question.",
+    Submits the entire PDF in a single API call (limit: 100 pages / 32 MB) — ask for everything needed in one comprehensive question.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -108,25 +117,32 @@ Submits the entire PDF in a single API call (limit: 100 pages / 32 MB) — ask f
 // ── Tool implementations ──────────────────────────────────────────────────────
 
 fn run_shell(command: &str) -> String {
-    match std::process::Command::new("sh").arg("-c").arg(command).output() {
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .output()
+    {
         Ok(out) => {
             let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
             s.push_str(&String::from_utf8_lossy(&out.stderr));
-            if s.trim().is_empty() { "(no output)".into() } else { s }
+            if s.trim().is_empty() {
+                "(no output)".into()
+            } else {
+                s
+            }
         }
         Err(e) => format!("Error: {e}"),
     }
 }
 
 fn file_to_b64(path: &str) -> Result<(String, String), String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("Error: could not read {path}: {e}"))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("Error: could not read {path}: {e}"))?;
     let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
     let mime = match ext.as_str() {
         "png" => "image/png",
         "gif" => "image/gif",
         "pdf" => "application/pdf",
-        _     => "image/jpeg",
+        _ => "image/jpeg",
     };
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok((mime.to_string(), b64))
@@ -145,7 +161,12 @@ fn llm_single_call(model: &str, content_block: Value, question: &str) -> String 
         }
         match llm_request(&llm_url()).send_json(&req) {
             Ok(resp) => match resp.into_json::<Value>() {
-                Ok(v)  => return v["content"][0]["text"].as_str().unwrap_or("No response").to_string(),
+                Ok(v) => {
+                    return v["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or("No response")
+                        .to_string()
+                }
                 Err(e) => return format!("Parse error: {e}"),
             },
             Err(ureq::Error::Status(502, resp)) => {
@@ -166,17 +187,27 @@ fn llm_single_call(model: &str, content_block: Value, question: &str) -> String 
 }
 
 fn read_image(model: &str, path: &str, question: &str) -> String {
-    let (mime, b64) = match file_to_b64(path) { Ok(v) => v, Err(e) => return e };
-    llm_single_call(model,
+    let (mime, b64) = match file_to_b64(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    llm_single_call(
+        model,
         json!({"type":"image","source":{"type":"base64","media_type":mime,"data":b64}}),
-        question)
+        question,
+    )
 }
 
 fn read_pdf(model: &str, path: &str, question: &str) -> String {
-    let (_, b64) = match file_to_b64(path) { Ok(v) => v, Err(e) => return e };
-    llm_single_call(model,
+    let (_, b64) = match file_to_b64(path) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    llm_single_call(
+        model,
         json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}}),
-        question)
+        question,
+    )
 }
 
 // ── LLM ReAct call ────────────────────────────────────────────────────────────
@@ -206,12 +237,14 @@ fn llm_call(model: &str, messages: &Value, full_system: &str) -> Result<Value, S
         if let Some(arr) = req_msgs.as_array_mut() {
             if let Some(last_human) = arr.iter_mut().rev().find(|m| {
                 m["role"] == "user"
-                    && m["content"].as_array()
+                    && m["content"]
+                        .as_array()
                         .and_then(|a| a.first())
                         .and_then(|b| b.get("type"))
                         .and_then(|t| t.as_str())
                         != Some("tool_result")
-                    && m["content"].as_array()
+                    && m["content"]
+                        .as_array()
                         .and_then(|a| a.last())
                         .and_then(|b| b.get("cache_control"))
                         .is_none()
@@ -231,7 +264,11 @@ fn llm_call(model: &str, messages: &Value, full_system: &str) -> Result<Value, S
             "messages":   req_msgs,
         });
         match llm_request(&llm_url()).send_json(&req) {
-            Ok(resp) => return resp.into_json::<Value>().map_err(|e| format!("Parse error: {e}")),
+            Ok(resp) => {
+                return resp
+                    .into_json::<Value>()
+                    .map_err(|e| format!("Parse error: {e}"))
+            }
             Err(ureq::Error::Status(400, resp)) => {
                 let body = resp.into_string().unwrap_or_default();
                 if body.contains("prompt is too long") {
@@ -242,9 +279,12 @@ fn llm_call(model: &str, messages: &Value, full_system: &str) -> Result<Value, S
                         if let Some(last) = arr.iter_mut().rev().find(|m| m["role"] == "user") {
                             if let Some(content) = last["content"].as_array_mut() {
                                 // Find the largest tool_result block and shrink it
-                                let largest = content.iter_mut()
+                                let largest = content
+                                    .iter_mut()
                                     .filter(|b| b["type"] == "tool_result")
-                                    .max_by_key(|b| b["content"].as_str().map(|s| s.len()).unwrap_or(0));
+                                    .max_by_key(|b| {
+                                        b["content"].as_str().map(|s| s.len()).unwrap_or(0)
+                                    });
                                 if let Some(block) = largest {
                                     block["content"] = json!("[output removed — too large for context. The data was saved to disk; query it there.]");
                                 }
@@ -285,8 +325,11 @@ fn thread_path(thread_id: &str) -> String {
 
 fn load_thread(thread_id: &str) -> Vec<Value> {
     let path = thread_path(thread_id);
-    let Ok(contents) = std::fs::read_to_string(&path) else { return vec![] };
-    contents.lines()
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    contents
+        .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect()
 }
@@ -294,9 +337,16 @@ fn load_thread(thread_id: &str) -> Vec<Value> {
 fn append_thread(thread_id: &str, new_messages: &[Value]) {
     use std::io::Write;
     let path = thread_path(thread_id);
-    let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         Ok(f) => f,
-        Err(e) => { eprintln!("[agent] thread write error: {e}"); return; }
+        Err(e) => {
+            eprintln!("[agent] thread write error: {e}");
+            return;
+        }
     };
     for msg in new_messages {
         if let Ok(line) = serde_json::to_string(msg) {
@@ -307,7 +357,12 @@ fn append_thread(thread_id: &str, new_messages: &[Value]) {
 
 // ── ReAct loop ────────────────────────────────────────────────────────────────
 
-fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -> Result<String, String> {
+fn run_task(
+    model: &str,
+    task: &str,
+    max_iter: usize,
+    thread_id: Option<&str>,
+) -> Result<String, String> {
     // Build system prompt once — identical string every iteration = stable cache key
     let skill_ctx = inject_skill(task);
     let full_system = format!("{}{}", system_prompt(), skill_ctx);
@@ -322,7 +377,11 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
     let mut messages = if let Some(tid) = thread_id {
         let mut history = load_thread(tid);
         if !history.is_empty() {
-            eprintln!("[agent] resuming thread {} ({} prior messages)", tid, history.len());
+            eprintln!(
+                "[agent] resuming thread {} ({} prior messages)",
+                tid,
+                history.len()
+            );
         }
         history.push(task_msg);
         json!(history)
@@ -335,26 +394,34 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
     for iter in 0..max_iter {
         eprintln!("[agent] iter {}", iter + 1);
         let resp = match llm_call(model, &messages, &full_system) {
-            Ok(v)  => v,
+            Ok(v) => v,
             Err(e) => return Err(format!("llm error on iteration {}: {}", iter + 1, e)),
         };
 
         let content = match resp["content"].as_array() {
             Some(c) => c.clone(),
-            None    => return Err("no content in response".into()),
+            None => return Err("no content in response".into()),
         };
 
         let mut text_parts: Vec<String> = vec![];
-        let mut tool_calls: Vec<Value>  = vec![];
+        let mut tool_calls: Vec<Value> = vec![];
         for block in &content {
             match block["type"].as_str() {
-                Some("text")     => { if let Some(t) = block["text"].as_str() { text_parts.push(t.to_string()); } }
-                Some("tool_use") => { tool_calls.push(block.clone()); }
+                Some("text") => {
+                    if let Some(t) = block["text"].as_str() {
+                        text_parts.push(t.to_string());
+                    }
+                }
+                Some("tool_use") => {
+                    tool_calls.push(block.clone());
+                }
                 _ => {}
             }
         }
 
-        messages.as_array_mut().unwrap()
+        messages
+            .as_array_mut()
+            .unwrap()
             .push(json!({ "role": "assistant", "content": content }));
 
         if tool_calls.is_empty() {
@@ -368,28 +435,40 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
 
         let mut tool_results: Vec<Value> = vec![];
         for tc in &tool_calls {
-            let name  = tc["name"].as_str().unwrap_or("");
+            let name = tc["name"].as_str().unwrap_or("");
             let input = &tc["input"];
-            let id    = tc["id"].as_str().unwrap_or("");
+            let id = tc["id"].as_str().unwrap_or("");
 
             match name {
-                "run_shell" => eprintln!("[agent] run_shell: {}", input["command"].as_str().unwrap_or("")),
-                "read_image" => eprintln!("[agent] read_image: {}", input["path"].as_str().unwrap_or("")),
-                "read_pdf"   => eprintln!("[agent] read_pdf: {}", input["path"].as_str().unwrap_or("")),
+                "run_shell" => eprintln!(
+                    "[agent] run_shell: {}",
+                    input["command"].as_str().unwrap_or("")
+                ),
+                "read_image" => eprintln!(
+                    "[agent] read_image: {}",
+                    input["path"].as_str().unwrap_or("")
+                ),
+                "read_pdf" => {
+                    eprintln!("[agent] read_pdf: {}", input["path"].as_str().unwrap_or(""))
+                }
                 _ => eprintln!("[agent] tool: {name}"),
             }
 
             let raw = match name {
-                "run_shell"  => run_shell(input["command"].as_str().unwrap_or("")),
+                "run_shell" => run_shell(input["command"].as_str().unwrap_or("")),
                 "read_image" => read_image(
                     model,
                     input["path"].as_str().unwrap_or(""),
-                    input["question"].as_str().unwrap_or("Extract all text and data from this image verbatim."),
+                    input["question"]
+                        .as_str()
+                        .unwrap_or("Extract all text and data from this image verbatim."),
                 ),
-                "read_pdf"    => read_pdf(
+                "read_pdf" => read_pdf(
                     model,
                     input["path"].as_str().unwrap_or(""),
-                    input["question"].as_str().unwrap_or("Extract all text and data from this PDF verbatim."),
+                    input["question"]
+                        .as_str()
+                        .unwrap_or("Extract all text and data from this PDF verbatim."),
                 ),
                 _ => format!("unknown tool: {name}"),
             };
@@ -408,7 +487,10 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
                          Example: grep -n 'keyword' {out_path} | head -30",
                         raw.len()
                     ),
-                    Err(e) => format!("[{ts}] Output too large ({} chars) and could not save to disk: {e}", raw.len()),
+                    Err(e) => format!(
+                        "[{ts}] Output too large ({} chars) and could not save to disk: {e}",
+                        raw.len()
+                    ),
                 }
             } else {
                 format!("[{ts}]\n{raw}")
@@ -421,7 +503,9 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
             }));
         }
 
-        messages.as_array_mut().unwrap()
+        messages
+            .as_array_mut()
+            .unwrap()
             .push(json!({ "role": "user", "content": tool_results }));
 
         if let Some(tid) = thread_id {
@@ -445,7 +529,8 @@ fn main() {
     let skip: std::collections::HashSet<usize> = thread_flag_pos
         .map(|i| [i, i + 1].into_iter().collect())
         .unwrap_or_default();
-    let filtered: Vec<&String> = args.iter()
+    let filtered: Vec<&String> = args
+        .iter()
         .enumerate()
         .filter(|(i, _)| !skip.contains(i))
         .map(|(_, a)| a)
@@ -454,9 +539,15 @@ fn main() {
     // CLI mode:   agent [--thread <id>] 'task' [model] [max_iter]
     // Stdin mode: agent [--thread <id>] < task.txt
     let (task, model, max_iter) = if filtered.len() > 1 {
-        let task     = filtered[1].clone();
-        let model    = filtered.get(2).map(|s| s.to_string()).unwrap_or_else(|| llm_model());
-        let max_iter = filtered.get(3).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_MAX_ITER);
+        let task = filtered[1].clone();
+        let model = filtered
+            .get(2)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| llm_model());
+        let max_iter = filtered
+            .get(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_ITER);
         (task, model, max_iter)
     } else {
         let mut buf = String::new();
@@ -476,6 +567,9 @@ fn main() {
             println!("ai_result");
             println!("{result}");
         }
-        Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     }
 }
