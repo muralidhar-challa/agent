@@ -91,10 +91,13 @@ trait Provider {
     fn tool_defs(&self) -> Value;
     fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value) -> Value;
     fn parse_response(&self, resp: Value) -> Result<ParsedResponse, String>;
-    /// Returns one or more messages to append to history for the given tool results.
     fn wrap_tool_results(&self, results: Vec<ToolResult>) -> Vec<Value>;
-    /// Provider-specific context-trim: shrink the largest tool result in history.
     fn trim_last_tool_result(&self, messages: &mut Value);
+    // ── Vision helpers ────────────────────────────────────────────────────────
+    fn image_block(&self, mime: &str, b64: &str) -> Value;
+    fn pdf_block(&self, b64: &str) -> Option<Value>;
+    fn build_vision_request(&self, model: &str, content_block: Value, question: &str) -> Value;
+    fn parse_vision_response(&self, resp: Value) -> String;
 }
 
 // ── Anthropic provider ────────────────────────────────────────────────────────
@@ -198,6 +201,26 @@ impl Provider for Anthropic {
             }
         }
     }
+
+    fn image_block(&self, mime: &str, b64: &str) -> Value {
+        json!({"type":"image","source":{"type":"base64","media_type":mime,"data":b64}})
+    }
+
+    fn pdf_block(&self, b64: &str) -> Option<Value> {
+        Some(json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}}))
+    }
+
+    fn build_vision_request(&self, model: &str, content_block: Value, question: &str) -> Value {
+        json!({
+            "model": model,
+            "max_tokens": 4096,
+            "messages": [{"role":"user","content":[content_block,{"type":"text","text":question}]}]
+        })
+    }
+
+    fn parse_vision_response(&self, resp: Value) -> String {
+        resp["content"][0]["text"].as_str().unwrap_or("No response").to_string()
+    }
 }
 
 // ── OpenAI provider ───────────────────────────────────────────────────────────
@@ -274,7 +297,6 @@ impl Provider for OpenAI {
 
     fn trim_last_tool_result(&self, messages: &mut Value) {
         if let Some(arr) = messages.as_array_mut() {
-            // Find the largest role:tool message and shrink its content
             let largest = arr.iter_mut()
                 .filter(|m| m["role"] == "tool")
                 .max_by_key(|m| m["content"].as_str().map(|s| s.len()).unwrap_or(0));
@@ -282,6 +304,26 @@ impl Provider for OpenAI {
                 msg["content"] = json!("[output removed — too large for context. The data was saved to disk; query it there.]");
             }
         }
+    }
+
+    fn image_block(&self, mime: &str, b64: &str) -> Value {
+        json!({"type":"image_url","image_url":{"url":format!("data:{mime};base64,{b64}")}})
+    }
+
+    fn pdf_block(&self, _b64: &str) -> Option<Value> {
+        None
+    }
+
+    fn build_vision_request(&self, model: &str, content_block: Value, question: &str) -> Value {
+        json!({
+            "model": model,
+            "max_tokens": 4096,
+            "messages": [{"role":"user","content":[content_block,{"type":"text","text":question}]}]
+        })
+    }
+
+    fn parse_vision_response(&self, resp: Value) -> String {
+        resp["choices"][0]["message"]["content"].as_str().unwrap_or("No response").to_string()
     }
 }
 
@@ -362,13 +404,10 @@ fn file_to_b64(path: &str) -> Result<(String, String), String> {
     Ok((mime.to_string(), b64))
 }
 
-fn llm_single_call(content_block: Value, question: &str) -> String {
-    let req = json!({
-        "model": llm_model(),
-        "max_tokens": 4096,
-        "messages": [{ "role": "user", "content": [content_block, {"type":"text","text":question}] }]
-    });
+fn llm_single_call(provider: &dyn Provider, content_block: Value, question: &str) -> String {
     let url = llm_url();
+    let model = llm_model();
+    let req = provider.build_vision_request(&model, content_block, question);
     let mut last_err = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
@@ -376,7 +415,7 @@ fn llm_single_call(content_block: Value, question: &str) -> String {
         }
         match llm_request(&url).send_json(&req) {
             Ok(resp) => match resp.into_json::<Value>() {
-                Ok(v)  => return v["content"][0]["text"].as_str().unwrap_or("No response").to_string(),
+                Ok(v)  => return provider.parse_vision_response(v),
                 Err(e) => return format!("Parse error: {e}"),
             },
             Err(ureq::Error::Status(502, resp)) => {
@@ -396,18 +435,19 @@ fn llm_single_call(content_block: Value, question: &str) -> String {
     last_err
 }
 
-fn read_image(path: &str, question: &str) -> String {
+fn read_image(provider: &dyn Provider, path: &str, question: &str) -> String {
     let (mime, b64) = match file_to_b64(path) { Ok(v) => v, Err(e) => return e };
-    llm_single_call(
-        json!({"type":"image","source":{"type":"base64","media_type":mime,"data":b64}}),
-        question)
+    let content_block = provider.image_block(&mime, &b64);
+    llm_single_call(provider, content_block, question)
 }
 
-fn read_pdf(path: &str, question: &str) -> String {
+fn read_pdf(provider: &dyn Provider, path: &str, question: &str) -> String {
     let (_, b64) = match file_to_b64(path) { Ok(v) => v, Err(e) => return e };
-    llm_single_call(
-        json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}}),
-        question)
+    match provider.pdf_block(&b64) {
+        Some(block) => llm_single_call(provider, block, question),
+        None => "PDF reading is not supported with this provider. \
+                 Use an Anthropic endpoint or extract text with pdftotext first.".to_string(),
+    }
 }
 
 // ── LLM ReAct call ────────────────────────────────────────────────────────────
@@ -485,7 +525,7 @@ fn append_thread(thread_id: &str, new_messages: &[Value]) {
 
 // ── ReAct loop ────────────────────────────────────────────────────────────────
 
-fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -> Result<String, String> {
+fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>, verbose: bool) -> Result<String, String> {
     let url = llm_url();
     let provider = detect_provider(&url);
 
@@ -543,10 +583,12 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
             let raw = match tc.name.as_str() {
                 "run_shell"  => run_shell(tc.input["command"].as_str().unwrap_or("")),
                 "read_image" => read_image(
+                    provider.as_ref(),
                     tc.input["path"].as_str().unwrap_or(""),
                     tc.input["question"].as_str().unwrap_or("Extract all text and data from this image verbatim."),
                 ),
                 "read_pdf"   => read_pdf(
+                    provider.as_ref(),
                     tc.input["path"].as_str().unwrap_or(""),
                     tc.input["question"].as_str().unwrap_or("Extract all text and data from this PDF verbatim."),
                 ),
@@ -571,6 +613,10 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
                 format!("[{ts}]\n{raw}")
             };
 
+            if verbose {
+                eprintln!("[agent] tool result: {}", &content[..content.len().min(500)]);
+            }
+
             tool_results.push(ToolResult { tool_use_id: tc.id.clone(), content });
         }
 
@@ -593,11 +639,15 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    let verbose = args.iter().any(|a| a == "--verbose");
+
     let thread_flag_pos = args.iter().position(|a| a == "--thread");
     let thread_id = thread_flag_pos.and_then(|i| args.get(i + 1)).cloned();
-    let skip: std::collections::HashSet<usize> = thread_flag_pos
+    let mut skip: std::collections::HashSet<usize> = thread_flag_pos
         .map(|i| [i, i + 1].into_iter().collect())
         .unwrap_or_default();
+    // exclude --verbose from positional args
+    if let Some(i) = args.iter().position(|a| a == "--verbose") { skip.insert(i); }
     let filtered: Vec<&String> = args.iter()
         .enumerate()
         .filter(|(i, _)| !skip.contains(i))
@@ -620,7 +670,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    match run_task(&model, &task, max_iter, thread_id.as_deref()) {
+    match run_task(&model, &task, max_iter, thread_id.as_deref(), verbose) {
         Ok(result) => {
             println!("ai_result");
             println!("{result}");
