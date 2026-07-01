@@ -19,14 +19,17 @@ pub const DEFAULT_SUB_MAX_ITER: usize = 25;
 /// Largest tool output kept inline before spilling to disk.
 const MAX_INLINE_CHARS: usize = 16_000;
 
-/// Shared execution context, unchanged across the whole run tree.
+/// Shared services, plus this run's own tool-call budget. Budgets are per-run and
+/// independent — a sub-agent never draws from its parent's pool.
 pub struct Ctx<'a> {
     pub client: &'a dyn LlmClient,
     pub provider: &'a dyn Provider,
     pub paths: &'a Paths,
     pub model: &'a str,
-    /// Total tool-call budget shared by the whole tree.
+    /// Tool-call budget for the current run only.
     pub budget: Rc<Cell<usize>>,
+    /// Starting tool-call budget handed to each delegated sub-agent (its own).
+    pub sub_budget: usize,
     /// Number of sub-agents delegated so far by the top-level run.
     pub fanout: Rc<Cell<usize>>,
     pub max_fanout: usize,
@@ -417,6 +420,7 @@ mod tests {
             paths,
             model: "m",
             budget: Rc::new(Cell::new(budget)),
+            sub_budget: budget,
             fanout: Rc::new(Cell::new(0)),
             max_fanout: 8,
         }

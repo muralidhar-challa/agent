@@ -69,8 +69,9 @@ blocked", "output": "...", "steps_taken": N, ... }`.
   `--thread` run) so a long subtask can resume after a restart instead of
   starting over.
 
-A shared budget and a fan-out cap bound total work across a run and all of its
-sub-agents (see [Configuration](#configuration)).
+Each run — the top-level loop and every sub-agent — gets its own independent
+tool-call budget (no shared pool), and a fan-out cap limits how many sub-agents a
+run may spawn (see [Configuration](#configuration)).
 
 ## Skills (Runtime Injection)
 
@@ -103,7 +104,7 @@ The provider is inferred automatically from `LLM_URL`:
 | `LLM_MODEL` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Model ID |
 | `LLM_API_KEY` | — | API key (omit if auth is handled by proxy) |
 | `AGENT_DIR` | `/var/actor/.agent` | Path to system prompt + skills directory |
-| `AGENT_TOTAL_BUDGET` | `200` | Max tool calls shared across a run and all its sub-agents |
+| `AGENT_TOOL_BUDGET` | `200` | Max tool calls per run (the top-level run and each sub-agent get their own) |
 | `AGENT_MAX_FANOUT` | `8` | Max sub-agents a single run may delegate |
 
 ## Threads

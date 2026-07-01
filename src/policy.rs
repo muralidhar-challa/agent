@@ -24,7 +24,7 @@ pub enum Ending {
     Stopped,
     /// Reached the per-run iteration cap.
     IterExhausted,
-    /// Reached the shared budget cap.
+    /// Reached this run's tool-call budget cap.
     BudgetExhausted,
     /// Transport or model error.
     Failed,

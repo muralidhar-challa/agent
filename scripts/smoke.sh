@@ -54,7 +54,7 @@ head -c 400 "$WORK/out1.txt"; echo
 # ── 2. Durable delegation within a thread ───────────────────────────────────────
 note "2. Durable sub-agent in a thread"
 TID="smoke-$$"
-export AGENT_TOTAL_BUDGET="${AGENT_TOTAL_BUDGET:-200}"
+export AGENT_TOOL_BUDGET="${AGENT_TOOL_BUDGET:-200}"
 DTASK='Use spawn_agent with persistence "durable" to delegate: list the files in /etc and count them, then report the count.'
 if "$BIN" --thread "$TID" "$DTASK" >"$WORK/out2.txt" 2>"$WORK/err2.txt"; then
     ok "durable thread run completed"

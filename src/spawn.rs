@@ -3,6 +3,9 @@
 //! context (that is the whole point — the caller does not carry its intermediate
 //! steps) and cannot delegate further.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use serde_json::{json, Value};
 
 use crate::agent_loop::{run, Ctx, RunConfig, DEFAULT_SUB_MAX_ITER};
@@ -36,10 +39,6 @@ pub fn handle(ctx: &Ctx, parent_depth: usize, parent_tid: Option<&str>, input: &
         .unwrap_or(DEFAULT_SUB_MAX_ITER);
     let job = Job::new(task, checks, persistence, max_iter);
 
-    if ctx.budget.get() == 0 {
-        return JobResult::partial(&job.id, "no budget to start".into(), FailureKind::BudgetExceeded, 0);
-    }
-
     // Durable only takes effect when the parent itself is persisted, since resume
     // is driven from the parent's registry.
     let durable = persistence == Persistence::Durable && parent_tid.is_some();
@@ -53,8 +52,19 @@ pub fn handle(ctx: &Ctx, parent_depth: usize, parent_tid: Option<&str>, input: &
         registry::append_issued(ctx.paths, parent_tid.unwrap(), &job);
     }
 
+    // The sub-agent runs with its own fresh budget — independent of the caller's.
+    let child_ctx = Ctx {
+        client: ctx.client,
+        provider: ctx.provider,
+        paths: ctx.paths,
+        model: ctx.model,
+        budget: Rc::new(Cell::new(ctx.sub_budget)),
+        sub_budget: ctx.sub_budget,
+        fanout: ctx.fanout.clone(),
+        max_fanout: ctx.max_fanout,
+    };
     let result = run(
-        ctx,
+        &child_ctx,
         RunConfig {
             job: job.clone(),
             policy: sub_policy(),
@@ -129,6 +139,7 @@ mod tests {
             paths,
             model: "m",
             budget: Rc::new(Cell::new(budget)),
+            sub_budget: budget,
             fanout,
             max_fanout,
         }
@@ -188,6 +199,35 @@ mod tests {
         let recs = registry::load(&paths, "main");
         assert_eq!(recs.len(), 2); // issued + result
         assert!(registry::in_flight(&recs).is_empty());
+    }
+
+    #[test]
+    fn sub_budget_is_independent_of_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().to_path_buf());
+        let client = ScriptedClient {
+            responses: RefCell::new(vec![
+                json!({"content":[{"type":"tool_use","id":"s1","name":"run_shell","input":{"command":"true"}}]}),
+                json!({"content":[{"type":"text","text":"sub done"}]}),
+            ]),
+        };
+        let provider = Anthropic;
+        // Parent's own budget is exhausted, but the sub-agent gets its own allowance
+        // and runs to completion — no tree-wide pool couples them.
+        let c = Ctx {
+            client: &client,
+            provider: &provider,
+            paths: &paths,
+            model: "m",
+            budget: Rc::new(Cell::new(0)),
+            sub_budget: 50,
+            fanout: Rc::new(Cell::new(0)),
+            max_fanout: 8,
+        };
+        let r = handle(&c, 0, None, &json!({"task": "work"}));
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.steps_taken, 1); // sub spent its own budget, not the parent's
+        assert_eq!(c.budget.get(), 0); // parent counter untouched
     }
 
     #[test]

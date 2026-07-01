@@ -21,7 +21,7 @@ use agent::provider::detect_provider;
 use agent::thread::Paths;
 
 const DEFAULT_MAX_ITER: usize = 50;
-const DEFAULT_TOTAL_BUDGET: usize = 200;
+const DEFAULT_TOOL_BUDGET: usize = 200;
 const DEFAULT_MAX_FANOUT: usize = 8;
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -74,12 +74,16 @@ fn main() {
     let client = UreqClient;
     let paths = Paths::system();
 
+    // Per-run tool-call budget: the top-level run and each sub-agent each get their
+    // own fresh allowance of this size — no tree-wide pool.
+    let tool_budget = env_usize("AGENT_TOOL_BUDGET", DEFAULT_TOOL_BUDGET);
     let ctx = Ctx {
         client: &client,
         provider: provider.as_ref(),
         paths: &paths,
         model: &model,
-        budget: Rc::new(Cell::new(env_usize("AGENT_TOTAL_BUDGET", DEFAULT_TOTAL_BUDGET))),
+        budget: Rc::new(Cell::new(tool_budget)),
+        sub_budget: tool_budget,
         fanout: Rc::new(Cell::new(0)),
         max_fanout: env_usize("AGENT_MAX_FANOUT", DEFAULT_MAX_FANOUT),
     };
