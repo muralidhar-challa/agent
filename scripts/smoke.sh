@@ -55,14 +55,19 @@ head -c 400 "$WORK/out1.txt"; echo
 note "2. Durable sub-agent in a thread"
 TID="smoke-$$"
 export AGENT_TOOL_BUDGET="${AGENT_TOOL_BUDGET:-200}"
+# The agent writes state under std::env::temp_dir(), which honors $TMPDIR
+# (e.g. nix-shell). Check the same location, not a hardcoded /tmp.
+TMP="${TMPDIR:-/tmp}"; TMP="${TMP%/}"
+THREAD_FILE="$TMP/agent_thread_${TID}.jsonl"
+REGISTRY_FILE="$TMP/agent_registry_${TID}.jsonl"
 DTASK='Use spawn_agent with persistence "durable" to delegate: list the files in /etc and count them, then report the count.'
 if "$BIN" --thread "$TID" "$DTASK" >"$WORK/out2.txt" 2>"$WORK/err2.txt"; then
     ok "durable thread run completed"
 else
     bad "durable thread run exited non-zero (see $WORK/err2.txt)"
 fi
-[ -f "/tmp/agent_thread_${TID}.jsonl" ] && ok "conversation persisted" || bad "no thread file written"
-if [ -f "/tmp/agent_registry_${TID}.jsonl" ]; then
+[ -f "$THREAD_FILE" ] && ok "conversation persisted" || bad "no thread file written"
+if [ -f "$REGISTRY_FILE" ]; then
     ok "durable registry written"
     echo "  To test crash-resume manually:"
     echo "    $BIN --thread $TID '<a long durable task>'   # then SIGKILL mid-run"
@@ -72,7 +77,7 @@ else
 fi
 
 # Clean up this run's thread/registry artifacts.
-rm -f "/tmp/agent_thread_${TID}.jsonl" "/tmp/agent_registry_${TID}.jsonl"
+rm -f "$THREAD_FILE" "$REGISTRY_FILE"
 
 note "Summary"
 printf 'passed: %s   failed: %s\n' "$PASS" "$FAIL"
