@@ -5,6 +5,7 @@
 
 use serde_json::{json, Value};
 
+use crate::job::Effort;
 use crate::provider::Provider;
 
 const DEFAULT_MODEL: &str = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
@@ -36,6 +37,7 @@ pub trait LlmClient {
         messages: &mut Value,
         system: &str,
         tools: &Value,
+        effort: Effort,
     ) -> Result<Value, String>;
 }
 
@@ -93,6 +95,7 @@ impl LlmClient for UreqClient {
         messages: &mut Value,
         system: &str,
         tools: &Value,
+        effort: Effort,
     ) -> Result<Value, String> {
         let url = llm_url();
         let mut last_err = String::new();
@@ -100,7 +103,7 @@ impl LlmClient for UreqClient {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            let req = provider.build_request(model, system, tools, messages);
+            let req = provider.build_request(model, system, tools, messages, effort);
             let outcome = match llm_request(&url).send_json(&req) {
                 Ok(resp) => match resp.into_json::<Value>() {
                     Ok(v) => Attempt::Ok(v),

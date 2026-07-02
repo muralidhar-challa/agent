@@ -9,7 +9,7 @@ use std::rc::Rc;
 use serde_json::{json, Value};
 
 use crate::agent_loop::{run, Ctx, RunConfig, DEFAULT_SUB_MAX_ITER};
-use crate::job::{FailureKind, Job, JobResult, Persistence};
+use crate::job::{Effort, FailureKind, Job, JobResult, Persistence};
 use crate::policy::sub_policy;
 use crate::{registry, thread};
 
@@ -37,7 +37,19 @@ pub fn handle(ctx: &Ctx, parent_depth: usize, parent_tid: Option<&str>, input: &
         .as_u64()
         .map(|n| n as usize)
         .unwrap_or(DEFAULT_SUB_MAX_ITER);
-    let job = Job::new(task, checks, persistence, max_iter);
+    let mut job = Job::new(task, checks, persistence, max_iter);
+
+    // Effort is per-run: a sub-agent can be given its own level via the tool
+    // call; when omitted it inherits the parent's, so a high-effort planner's
+    // delegated execution steps don't silently drop back to no reasoning. Stored
+    // on the job (not just passed to Ctx) so a durable resume reconstructs the
+    // same level via job_to_input rather than silently reverting to None.
+    let effort = input
+        .get("effort")
+        .and_then(|v| v.as_str())
+        .map(|s| Effort::parse(Some(s)))
+        .unwrap_or(ctx.effort);
+    job.effort = effort;
 
     // Durable only takes effect when the parent itself is persisted, since resume
     // is driven from the parent's registry.
@@ -58,6 +70,7 @@ pub fn handle(ctx: &Ctx, parent_depth: usize, parent_tid: Option<&str>, input: &
         provider: ctx.provider,
         paths: ctx.paths,
         model: ctx.model,
+        effort,
         budget: Rc::new(Cell::new(ctx.sub_budget)),
         sub_budget: ctx.sub_budget,
         fanout: ctx.fanout.clone(),
@@ -90,6 +103,12 @@ pub fn job_to_input(job: &Job) -> Value {
             Persistence::Ephemeral => "ephemeral",
             Persistence::Durable => "durable",
         },
+        "effort": match job.effort {
+            Effort::None => "none",
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        },
         "max_iter": job.max_iter,
     })
 }
@@ -106,6 +125,15 @@ mod tests {
 
     struct ScriptedClient {
         responses: RefCell<Vec<Value>>,
+        seen_effort: RefCell<Vec<Effort>>,
+    }
+    impl ScriptedClient {
+        fn new(responses: Vec<Value>) -> ScriptedClient {
+            ScriptedClient {
+                responses: RefCell::new(responses),
+                seen_effort: RefCell::new(vec![]),
+            }
+        }
     }
     impl LlmClient for ScriptedClient {
         fn call(
@@ -115,7 +143,9 @@ mod tests {
             _msgs: &mut Value,
             _s: &str,
             _t: &Value,
+            effort: Effort,
         ) -> Result<Value, String> {
+            self.seen_effort.borrow_mut().push(effort);
             let mut q = self.responses.borrow_mut();
             if q.is_empty() {
                 Err("no scripted response".into())
@@ -138,6 +168,7 @@ mod tests {
             provider,
             paths,
             model: "m",
+            effort: Effort::None,
             budget: Rc::new(Cell::new(budget)),
             sub_budget: budget,
             fanout,
@@ -149,7 +180,7 @@ mod tests {
     fn empty_task_is_blocked() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path().to_path_buf());
-        let client = ScriptedClient { responses: RefCell::new(vec![]) };
+        let client = ScriptedClient::new(vec![]);
         let provider = Anthropic;
         let c = mk_ctx(&client, &provider, &paths, 100, 8, Rc::new(Cell::new(0)));
         let r = handle(&c, 0, None, &json!({"task": "  "}));
@@ -160,7 +191,7 @@ mod tests {
     fn fanout_cap_returns_partial_without_running() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path().to_path_buf());
-        let client = ScriptedClient { responses: RefCell::new(vec![]) };
+        let client = ScriptedClient::new(vec![]);
         let provider = Anthropic;
         let fanout = Rc::new(Cell::new(2));
         let c = mk_ctx(&client, &provider, &paths, 100, 2, fanout);
@@ -173,9 +204,7 @@ mod tests {
     fn ephemeral_sub_runs_and_returns_result() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path().to_path_buf());
-        let client = ScriptedClient {
-            responses: RefCell::new(vec![json!({"content":[{"type":"text","text":"sub done"}]})]),
-        };
+        let client = ScriptedClient::new(vec![json!({"content":[{"type":"text","text":"sub done"}]})]);
         let provider = Anthropic;
         let c = mk_ctx(&client, &provider, &paths, 100, 8, Rc::new(Cell::new(0)));
         let r = handle(&c, 0, None, &json!({"task": "compute"}));
@@ -189,9 +218,7 @@ mod tests {
     fn durable_sub_records_issued_and_result() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path().to_path_buf());
-        let client = ScriptedClient {
-            responses: RefCell::new(vec![json!({"content":[{"type":"text","text":"durable done"}]})]),
-        };
+        let client = ScriptedClient::new(vec![json!({"content":[{"type":"text","text":"durable done"}]})]);
         let provider = Anthropic;
         let c = mk_ctx(&client, &provider, &paths, 100, 8, Rc::new(Cell::new(0)));
         let r = handle(&c, 0, Some("main"), &json!({"task":"long","persistence":"durable"}));
@@ -205,12 +232,10 @@ mod tests {
     fn sub_budget_is_independent_of_parent() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path().to_path_buf());
-        let client = ScriptedClient {
-            responses: RefCell::new(vec![
-                json!({"content":[{"type":"tool_use","id":"s1","name":"run_shell","input":{"command":"true"}}]}),
-                json!({"content":[{"type":"text","text":"sub done"}]}),
-            ]),
-        };
+        let client = ScriptedClient::new(vec![
+            json!({"content":[{"type":"tool_use","id":"s1","name":"run_shell","input":{"command":"true"}}]}),
+            json!({"content":[{"type":"text","text":"sub done"}]}),
+        ]);
         let provider = Anthropic;
         // Parent's own budget is exhausted, but the sub-agent gets its own allowance
         // and runs to completion — no tree-wide pool couples them.
@@ -219,6 +244,7 @@ mod tests {
             provider: &provider,
             paths: &paths,
             model: "m",
+            effort: Effort::None,
             budget: Rc::new(Cell::new(0)),
             sub_budget: 50,
             fanout: Rc::new(Cell::new(0)),
@@ -232,10 +258,38 @@ mod tests {
 
     #[test]
     fn job_to_input_round_trips_fields() {
-        let job = Job::new("t".into(), vec!["c".into()], Persistence::Durable, 7);
+        let mut job = Job::new("t".into(), vec!["c".into()], Persistence::Durable, 7);
+        job.effort = Effort::High;
         let v = job_to_input(&job);
         assert_eq!(v["task"], "t");
         assert_eq!(v["persistence"], "durable");
+        assert_eq!(v["effort"], "high");
         assert_eq!(v["max_iter"], 7);
+    }
+
+    #[test]
+    fn effort_defaults_to_parent_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().to_path_buf());
+        let client = ScriptedClient::new(vec![json!({"content":[{"type":"text","text":"done"}]})]);
+        let provider = Anthropic;
+        let mut c = mk_ctx(&client, &provider, &paths, 100, 8, Rc::new(Cell::new(0)));
+        c.effort = Effort::High;
+        let r = handle(&c, 0, None, &json!({"task": "compute"}));
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(client.seen_effort.borrow().as_slice(), &[Effort::High]);
+    }
+
+    #[test]
+    fn effort_override_wins_over_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().to_path_buf());
+        let client = ScriptedClient::new(vec![json!({"content":[{"type":"text","text":"done"}]})]);
+        let provider = Anthropic;
+        let mut c = mk_ctx(&client, &provider, &paths, 100, 8, Rc::new(Cell::new(0)));
+        c.effort = Effort::High;
+        let r = handle(&c, 0, None, &json!({"task": "compute", "effort": "low"}));
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(client.seen_effort.borrow().as_slice(), &[Effort::Low]);
     }
 }

@@ -14,7 +14,7 @@ use std::io::Read;
 use std::rc::Rc;
 
 use agent::agent_loop::{run, Ctx, RunConfig};
-use agent::job::{Job, Persistence};
+use agent::job::{Effort, Job, Persistence};
 use agent::llm::{llm_model, UreqClient};
 use agent::policy::root_policy;
 use agent::provider::detect_provider;
@@ -77,11 +77,16 @@ fn main() {
     // Per-run tool-call budget: the top-level run and each sub-agent each get their
     // own fresh allowance of this size — no tree-wide pool.
     let tool_budget = env_usize("AGENT_TOOL_BUDGET", DEFAULT_TOOL_BUDGET);
+    // Opt-in extended-reasoning effort for the top-level run; unset (or any value
+    // other than low/medium/high) sends no reasoning param, matching prior
+    // behavior. Sub-agents inherit this unless a spawn_agent call overrides it.
+    let effort = Effort::parse(std::env::var("AGENT_EFFORT").ok().as_deref());
     let ctx = Ctx {
         client: &client,
         provider: provider.as_ref(),
         paths: &paths,
         model: &model,
+        effort,
         budget: Rc::new(Cell::new(tool_budget)),
         sub_budget: tool_budget,
         fanout: Rc::new(Cell::new(0)),
