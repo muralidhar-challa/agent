@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use serde_json::{json, Value};
 
-use crate::job::{FailureKind, Job, JobResult, Status};
+use crate::job::{Effort, FailureKind, Job, JobResult, Status};
 use crate::llm::LlmClient;
 use crate::policy::{Ending, Policy, Progress};
 use crate::provider::{Provider, ToolResult};
@@ -26,6 +26,9 @@ pub struct Ctx<'a> {
     pub provider: &'a dyn Provider,
     pub paths: &'a Paths,
     pub model: &'a str,
+    /// Extended-reasoning effort for this run's model calls. `Effort::None` sends
+    /// no reasoning param at all — opt-in, matches prior behavior.
+    pub effort: Effort,
     /// Tool-call budget for the current run only.
     pub budget: Rc<Cell<usize>>,
     /// Starting tool-call budget handed to each delegated sub-agent (its own).
@@ -122,7 +125,7 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         eprintln!("[agent d{depth}] iter {}", iter + 1);
         let resp = match ctx
             .client
-            .call(ctx.provider, ctx.model, &mut messages, &system, &tool_set)
+            .call(ctx.provider, ctx.model, &mut messages, &system, &tool_set, ctx.effort)
         {
             Ok(v) => v,
             Err(e) => {
@@ -296,8 +299,21 @@ fn reconcile(ctx: &Ctx, parent_tid: &str, history: &mut Vec<Value>) {
             None => {
                 eprintln!("[agent d0] resuming in-flight job {}", job.id);
                 let child_tid = thread::child_thread_id(parent_tid, &job.id);
+                // Match spawn::handle's effort (job's own, not the parent run's) —
+                // budget/fanout reuse the parent ctx here as before this change.
+                let resumed_ctx = Ctx {
+                    client: ctx.client,
+                    provider: ctx.provider,
+                    paths: ctx.paths,
+                    model: ctx.model,
+                    effort: job.effort,
+                    budget: ctx.budget.clone(),
+                    sub_budget: ctx.sub_budget,
+                    fanout: ctx.fanout.clone(),
+                    max_fanout: ctx.max_fanout,
+                };
                 let r = run(
-                    ctx,
+                    &resumed_ctx,
                     RunConfig {
                         job: job.clone(),
                         policy: crate::policy::sub_policy(),
@@ -391,6 +407,7 @@ mod tests {
             _msgs: &mut Value,
             _s: &str,
             _t: &Value,
+            _effort: Effort,
         ) -> Result<Value, String> {
             let mut q = self.responses.borrow_mut();
             if q.is_empty() {
@@ -419,6 +436,7 @@ mod tests {
             provider,
             paths,
             model: "m",
+            effort: Effort::None,
             budget: Rc::new(Cell::new(budget)),
             sub_budget: budget,
             fanout: Rc::new(Cell::new(0)),
